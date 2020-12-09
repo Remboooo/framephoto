@@ -1,0 +1,3 @@
+Pillow
+numpy==1.19.3
+katna==0.4.1.4
