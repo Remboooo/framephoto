@@ -12,7 +12,19 @@ log = logging.getLogger(__name__)
 kimage = None
 
 
-def process(src, dest, target_res=(1280, 800), max_crop_aspect_diff=0.2):
+def pillow_l_to_opencv(img):
+    return cv2.cvtColor(np.array(img), cv2.COLOR_GRAY2BGR)
+
+
+def pillow_rgb_to_opencv(img):
+    return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
+
+def opencv_to_pillow(img):
+    return Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+
+
+def process(src, dest, target_res=(1280, 800), max_crop_aspect_diff=0.2, inpaint=False):
     global kimage
 
     img = Image.open(src)
@@ -58,9 +70,8 @@ def process(src, dest, target_res=(1280, 800), max_crop_aspect_diff=0.2):
         if kimage is None:
             kimage = KImage()
         filled = img.resize((filled_w, filled_h), Image.ANTIALIAS)
-        filled_opencv = cv2.cvtColor(np.array(filled), cv2.COLOR_RGB2BGR)
         crop_list = kimage.crop_image_from_cvimage(
-            input_image=filled_opencv, crop_width=target_w, crop_height=target_h, num_of_crops=1, down_sample_factor=4
+            input_image=pillow_rgb_to_opencv(filled), crop_width=target_w, crop_height=target_h, num_of_crops=1, down_sample_factor=4
         )
 
         if len(crop_list) > 0:
@@ -83,7 +94,15 @@ def process(src, dest, target_res=(1280, 800), max_crop_aspect_diff=0.2):
         log.debug("Fitting image to frame")
         # As final solution, just paste in the middle of the target
         fitted = img.resize((fitted_w, fitted_h), Image.ANTIALIAS)
-        target.paste(fitted, (round((target_w - fitted_w) / 2), round((target_h - fitted_h) / 2)))
+        x_pos, y_pos = round((target_w - fitted_w) / 2), round((target_h - fitted_h) / 2)
+        target.paste(fitted, (x_pos, y_pos))
+
+        if inpaint:
+            mask = np.full((target_w, target_h), fill_value=1, dtype=np.uint8)
+            mask[x_pos:x_pos+fitted_w, y_pos:y_pos + fitted_h] = 0
+            target = opencv_to_pillow(cv2.inpaint(pillow_rgb_to_opencv(target), mask.T, 3, cv2.INPAINT_TELEA))
+            target = target.filter(ImageFilter.GaussianBlur(round(target_w * 0.05)))
+            target.paste(fitted, (x_pos, y_pos))
 
     target.save(dest, "JPEG", quality=85)
 
@@ -139,6 +158,10 @@ def main():
         help="The file(s) or folder(s) (in case of --recurse) to transform"
     )
     argparse.add_argument(
+        "--inpaint", "-i", action='store_true',
+        help="Use image inpainting instead of black bars to fill empty spaces when the image is not frame-filling"
+    )
+    argparse.add_argument(
         "--recurse", "-r", action='store_true',
         help="Treat the input path(s) as folder and process all viable images within it. "
              "Skip images for which the target file already exists. "
@@ -165,6 +188,10 @@ def main():
         "--verbose", "-v", action='store_true',
         help="Enable verbose mode (debug logging)"
     )
+    argparse.add_argument(
+        "--overwrite", "-o", action='store_true',
+        help="Overwrite existing images. Default is to skip if target exists."
+    )
     args = argparse.parse_args()
 
     try:
@@ -189,20 +216,36 @@ def main():
                 for path in args.path if is_image_file(path)
             ]
 
+        exceptions = []
+
         for n, (src, dst) in enumerate(jobs):
             log.info(f"({n+1}/{len(jobs)}) {src} -> {dst}")
+            if not args.overwrite and os.path.exists(dst):
+                log.info(f"{dst} already exists, skipping")
+                continue
             if args.recurse and not args.dry_run:
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
             if args.dry_run:
                 log.info("Skipping image processing (--dry-run)")
             else:
-                process(src, dst, args.size)
+                try:
+                    process(src, dst, args.size, inpaint=args.inpaint)
+                except Exception as e:
+                    exceptions.append((src, dst, e))
+                    log.warning(f"Failed to process {src}: {str(e)}")
+
+        if exceptions:
+            log.warning(f"{len(exceptions)} image(s) failed to process")
+            sys.exit(-2)
     
     except UserInputException as e:
         print(str(e))
         print()
         argparse.print_help()
         sys.exit(-1)
+    except KeyboardInterrupt:
+        log.warning("Aborted by user")
+        sys.exit(-3)
 
 
 if __name__ == '__main__':
