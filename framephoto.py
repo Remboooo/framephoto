@@ -24,7 +24,7 @@ def opencv_to_pillow(img):
     return Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
 
 
-def process(src, dest, target_res=(1280, 800), max_crop_aspect_diff=0.2, inpaint=False):
+def process(src, dest, target_res=(1280, 800), max_crop_aspect_delta=0.2, inpaint=False):
     global kimage
 
     img = Image.open(src)
@@ -61,9 +61,9 @@ def process(src, dest, target_res=(1280, 800), max_crop_aspect_diff=0.2, inpaint
 
     image_pasted = False
 
-    if target_aspect * (1 - max_crop_aspect_diff) <= source_aspect <= target_aspect * (1 + max_crop_aspect_diff):
+    if target_aspect * (1 - max_crop_aspect_delta) <= source_aspect <= target_aspect * (1 + max_crop_aspect_delta):
         log.debug(
-            f"Source aspect ratio of {source_aspect:.2f} is within {max_crop_aspect_diff:.1%} "
+            f"Source aspect ratio of {source_aspect:.2f} is within {max_crop_aspect_delta:.1%} "
             f"of target aspect ratio {target_aspect:.2f}; using Katna to find best crop"
         )
         # Aspect ratio difference is OK; try smart crop
@@ -162,6 +162,14 @@ def main():
         help="Use image inpainting instead of black bars to fill empty spaces when the image is not frame-filling"
     )
     argparse.add_argument(
+        "--max-crop-aspect-delta", "-a", type=float, nargs="?", default=.2, 
+        help="Upper limit for aspect ratio mismatch between source image and target resolution to apply cropping in stead of fitting and filling. " + 
+        "E.g. if a 4:3 source image is processed for a 5:4 target resolution, (4/3)/(5/4) = 1.07. " + 
+        "This is within the default mismatch limit of 0.2 (a range of 0.8 - 1.2), so the image will be cropped. " + 
+        "A portrait image of 3:4 for the same target resolution will yield (3/4)/(5/4) = 0.6 which exceeds the mismatch limit of 0.2 (0.8 - 1.2), " + 
+        "so the image will be fitted and filled in stead."
+    )
+    argparse.add_argument(
         "--recurse", "-r", action='store_true',
         help="Treat the input path(s) as folder and process all viable images within it. "
              "Skip images for which the target file already exists. "
@@ -229,13 +237,15 @@ def main():
                 log.info("Skipping image processing (--dry-run)")
             else:
                 try:
-                    process(src, dst, args.size, inpaint=args.inpaint)
+                    process(src, dst, args.size, inpaint=args.inpaint, max_crop_aspect_delta=args.max_crop_aspect_delta)
                 except Exception as e:
                     exceptions.append((src, dst, e))
                     log.warning(f"Failed to process {src}: {str(e)}")
 
         if exceptions:
-            log.warning(f"{len(exceptions)} image(s) failed to process")
+            log.warning(f"{len(exceptions)} image(s) failed to process:")
+            for src, dst, e in exceptions:
+                log.warning(f"- {src}: {str(e)}")
             sys.exit(-2)
     
     except UserInputException as e:
