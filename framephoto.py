@@ -98,10 +98,40 @@ def process(src, dest, target_res=(1280, 800), max_crop_aspect_delta=0.2, inpain
         target.paste(fitted, (x_pos, y_pos))
 
         if inpaint:
+            # Create a stretched blurred version to give the inpainting algorithm some edges to work towards,
+            # otherwise it will always fade to solid grey towards the edges. This is especially noticeable
+            # in photos with a solid background that is far from black.
+            # We don't fully stretch the image to the target aspect ratio, but we also don't leave it
+            # as-is; we keep 20% of the original aspect ratio. This finds a bit of a middle ground
+            # between keeping sky and ground colors (pure stretching would do this perfectly) and
+            # creating large straight (horizontal/vertical) lines in the result (which pure zooming
+            # would result in)
+            zoom_w, zoom_h = round(filled_w * .2 + target_w * .8), round(filled_h * .2 + target_w * .8)
+            zoom_crop_x, zoom_crop_y = round((zoom_w - target_w)/2), round((zoom_h - target_h)/2)
+            target = img\
+                    .resize((zoom_w, zoom_h), Image.ANTIALIAS)\
+                    .filter(ImageFilter.GaussianBlur(round(target_w * 0.02)))\
+                    .crop((zoom_crop_x, zoom_crop_y, zoom_crop_x + target_w, zoom_crop_y + target_h))
+            target.paste(fitted, (x_pos, y_pos))
+
+            # Mark everything but the original image and a 1 pixel wide edge all around (containing the 
+            # stretched blurred version we created above) for inpainting.
             mask = np.full((target_w, target_h), fill_value=1, dtype=np.uint8)
             mask[x_pos:x_pos+fitted_w, y_pos:y_pos + fitted_h] = 0
+            mask[0,:] = 0
+            mask[target_w-1,:] = 0
+            mask[:,0] = 0
+            mask[:,target_h-1] = 0
+
+            # Do the inpainting
             target = opencv_to_pillow(cv2.inpaint(pillow_rgb_to_opencv(target), mask.T, 3, cv2.INPAINT_TELEA))
+
+            # Blur the inpainting result; we're not getting nor looking for a pixel-perfect continuation of the
+            # image, just some soft filler for the edge that doesn't contrast too much with the original
+            # scaled-down image in the center.
             target = target.filter(ImageFilter.GaussianBlur(round(target_w * 0.05)))
+
+            # Paste the original (scaled) image in the center.
             target.paste(fitted, (x_pos, y_pos))
 
     target.save(dest, "JPEG", quality=85)
