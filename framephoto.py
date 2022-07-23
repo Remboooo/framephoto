@@ -1,4 +1,6 @@
+import glob
 import os
+import platform
 from argparse import ArgumentParser
 from PIL import Image, ImageFilter, ImageDraw, ImageOps
 import numpy as np
@@ -7,6 +9,7 @@ import cv2
 import sys
 import logging
 
+from PIL.Image import Resampling
 
 log = logging.getLogger(__name__)
 kimage = None
@@ -69,7 +72,7 @@ def process(src, dest, target_res=(1280, 800), max_crop_aspect_delta=0.2, inpain
         # Aspect ratio difference is OK; try smart crop
         if kimage is None:
             kimage = KImage()
-        filled = img.resize((filled_w, filled_h), Image.ANTIALIAS)
+        filled = img.resize((filled_w, filled_h), Resampling.LANCZOS)
         crop_list = kimage.crop_image_from_cvimage(
             input_image=pillow_rgb_to_opencv(filled), crop_width=target_w, crop_height=target_h, num_of_crops=1, down_sample_factor=4
         )
@@ -91,17 +94,34 @@ def process(src, dest, target_res=(1280, 800), max_crop_aspect_delta=0.2, inpain
             log.warning("Katna found no appropriate crop")
 
     if not image_pasted:
+        # If cropping was not an option, fit the image to the frame and fill in the rest (w/ solid color or inpainting)
         log.debug("Fitting image to frame")
-        # As final solution, just paste in the middle of the target
-        fitted = img.resize((fitted_w, fitted_h), Image.ANTIALIAS)
+
+        if inpaint:
+            # For inpainting, the background should be a very blurry stretched version of the source image
+            stretched = img.resize((target_w, target_h), Resampling.LANCZOS)
+            target.paste(stretched, (0, 0))
+            target = target.filter(ImageFilter.GaussianBlur(round(max(target_w, target_h) * 0.05)))
+
+        fitted = img.resize((fitted_w, fitted_h), Resampling.LANCZOS)
         x_pos, y_pos = round((target_w - fitted_w) / 2), round((target_h - fitted_h) / 2)
         target.paste(fitted, (x_pos, y_pos))
 
         if inpaint:
-            mask = np.full((target_w, target_h), fill_value=1, dtype=np.uint8)
-            mask[x_pos:x_pos+fitted_w, y_pos:y_pos + fitted_h] = 0
-            target = opencv_to_pillow(cv2.inpaint(pillow_rgb_to_opencv(target), mask.T, 3, cv2.INPAINT_TELEA))
-            target = target.filter(ImageFilter.GaussianBlur(round(target_w * 0.05)))
+            inpaint_mask = np.full((target_w, target_h), fill_value=1, dtype=np.uint8)
+            inpaint_mask[x_pos:x_pos+fitted_w, y_pos:y_pos + fitted_h] = 0
+            inpainted = opencv_to_pillow(cv2.inpaint(pillow_rgb_to_opencv(target), inpaint_mask.T, 3, cv2.INPAINT_TELEA))
+            inpainted = inpainted.filter(ImageFilter.GaussianBlur(round(max(target_w, target_h) * 0.05)))
+
+            inpaint_alpha = np.full((target_w, target_h), fill_value=1, dtype=np.uint8)
+            if x_pos > 0:
+                inpaint_alpha[0:x_pos, :] = np.linspace(255, 0, x_pos)[:, np.newaxis]
+                inpaint_alpha[x_pos + fitted_w:target_w, :] = np.linspace(0, 255, target_w - x_pos - fitted_w)[:, np.newaxis]
+            else:
+                inpaint_alpha[:, 0:y_pos] = np.linspace(255, 0, y_pos)[np.newaxis, :]
+                inpaint_alpha[:, y_pos + fitted_h:target_h] = np.linspace(0, 255, target_h - y_pos - fitted_h)[np.newaxis, :]
+
+            target = Image.composite(target, inpainted, Image.fromarray(inpaint_alpha.T))
             target.paste(fitted, (x_pos, y_pos))
 
     target.save(dest, "JPEG", quality=85)
@@ -210,18 +230,22 @@ def main():
 
         destination_is_file = False
 
+        paths = args.path
+        if platform.system() == 'Windows':
+            paths = [p for path in paths for p in glob.glob(path)]
+
         if not os.path.isdir(args.destination):
-            if len(args.path) > 1 or args.recurse:
+            if len(paths) > 1 or args.recurse:
                 raise UserInputException("Destination must be an existing directory if multiple input files are specified")
             else:
                 destination_is_file = True
 
         if args.recurse:
-            jobs = get_recursive_jobs(args.path, args.destination, args.base)
+            jobs = get_recursive_jobs(paths, args.destination, args.base)
         else:
             jobs = [
                 (path, args.destination if destination_is_file else os.path.join(args.destination, os.path.basename(path)))
-                for path in args.path if is_image_file(path)
+                for path in paths if is_image_file(path)
             ]
 
         exceptions = []
@@ -240,7 +264,10 @@ def main():
                     process(src, dst, args.size, inpaint=args.inpaint, max_crop_aspect_delta=args.max_crop_aspect_delta)
                 except Exception as e:
                     exceptions.append((src, dst, e))
-                    log.warning(f"Failed to process {src}: {str(e)}")
+                    if log.isEnabledFor(logging.DEBUG):
+                        log.warning(f"Failed to process {src}: {str(e)}", exc_info=sys.exc_info())
+                    else:
+                        log.warning(f"Failed to process {src}: {str(e)}")
 
         if exceptions:
             log.warning(f"{len(exceptions)} image(s) failed to process:")
