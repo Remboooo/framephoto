@@ -8,6 +8,8 @@ from Katna.image import Image as KImage
 import cv2
 import sys
 import logging
+from queue import Queue
+from threading import Thread
 
 from PIL.Image import Resampling
 
@@ -108,20 +110,40 @@ def process(src, dest, target_res=(1280, 800), max_crop_aspect_delta=0.2, inpain
         target.paste(fitted, (x_pos, y_pos))
 
         if inpaint:
-            inpaint_mask = np.full((target_w, target_h), fill_value=1, dtype=np.uint8)
-            inpaint_mask[x_pos:x_pos+fitted_w, y_pos:y_pos + fitted_h] = 0
-            inpainted = opencv_to_pillow(cv2.inpaint(pillow_rgb_to_opencv(target), inpaint_mask.T, 3, cv2.INPAINT_TELEA))
-            inpainted = inpainted.filter(ImageFilter.GaussianBlur(round(max(target_w, target_h) * 0.05)))
+            # Create a stretched blurred version to give the inpainting algorithm some edges to work towards,
+            # otherwise it will always fade to solid grey towards the edges. This is especially noticeable
+            # in photos with a solid background that is far from black.
+            # We don't fully stretch the image to the target aspect ratio, but we also don't leave it
+            # as-is; we keep 20% of the original aspect ratio. This finds a bit of a middle ground
+            # between keeping sky and ground colors (pure stretching would do this perfectly) and
+            # creating large straight (horizontal/vertical) lines in the result (which pure zooming
+            # would result in)
+            zoom_w, zoom_h = round(filled_w * .2 + target_w * .8), round(filled_h * .2 + target_w * .8)
+            zoom_crop_x, zoom_crop_y = round((zoom_w - target_w)/2), round((zoom_h - target_h)/2)
+            target = img\
+                .resize((zoom_w, zoom_h), Resampling.LANCZOS)\
+                .filter(ImageFilter.GaussianBlur(round(max(target_h, target_w) * 0.02)))\
+                .crop((zoom_crop_x, zoom_crop_y, zoom_crop_x + target_w, zoom_crop_y + target_h))
+            target.paste(fitted, (x_pos, y_pos))
 
-            inpaint_alpha = np.full((target_w, target_h), fill_value=1, dtype=np.uint8)
-            if x_pos > 0:
-                inpaint_alpha[0:x_pos, :] = np.linspace(255, 0, x_pos)[:, np.newaxis]
-                inpaint_alpha[x_pos + fitted_w:target_w, :] = np.linspace(0, 255, target_w - x_pos - fitted_w)[:, np.newaxis]
-            else:
-                inpaint_alpha[:, 0:y_pos] = np.linspace(255, 0, y_pos)[np.newaxis, :]
-                inpaint_alpha[:, y_pos + fitted_h:target_h] = np.linspace(0, 255, target_h - y_pos - fitted_h)[np.newaxis, :]
+            # Mark everything but the original image and a 1 pixel wide edge all around (containing the 
+            # stretched blurred version we created above) for inpainting.
+            mask = np.full((target_w, target_h), fill_value=1, dtype=np.uint8)
+            mask[x_pos:x_pos+fitted_w, y_pos:y_pos + fitted_h] = 0
+            mask[0, :] = 0
+            mask[target_w-1, :] = 0
+            mask[:, 0] = 0
+            mask[:, target_h-1] = 0
 
-            target = Image.composite(target, inpainted, Image.fromarray(inpaint_alpha.T))
+            # Do the inpainting
+            target = opencv_to_pillow(cv2.inpaint(pillow_rgb_to_opencv(target), mask.T, 3, cv2.INPAINT_TELEA))
+
+            # Blur the inpainting result; we're not getting nor looking for a pixel-perfect continuation of the
+            # image, just some soft filler for the edge that doesn't contrast too much with the original
+            # scaled-down image in the center.
+            target = target.filter(ImageFilter.GaussianBlur(round(max(target_w, target_h) * 0.05)))
+
+            # Paste the original (scaled) image in the center.
             target.paste(fitted, (x_pos, y_pos))
 
     target.save(dest, "JPEG", quality=85)
@@ -154,7 +176,7 @@ def get_recursive_jobs(source_paths, destination, base_path):
         os.path.join(subdir, image_file)
         for path in paths
         for subdir, _, files in (
-            os.walk(path) if os.path.isdir(path) else [(os.path.dirname(path), 0, [os.path.basename(path)])]
+            os.walk(path, followlinks=True) if os.path.isdir(path) else [(os.path.dirname(path), 0, [os.path.basename(path)])]
         )
         for image_file in files
     )
@@ -250,24 +272,37 @@ def main():
 
         exceptions = []
 
-        for n, (src, dst) in enumerate(jobs):
-            log.info(f"({n+1}/{len(jobs)}) {src} -> {dst}")
-            if not args.overwrite and os.path.exists(dst):
-                log.info(f"{dst} already exists, skipping")
-                continue
-            if args.recurse and not args.dry_run:
-                os.makedirs(os.path.dirname(dst), exist_ok=True)
-            if args.dry_run:
-                log.info("Skipping image processing (--dry-run)")
-            else:
-                try:
-                    process(src, dst, args.size, inpaint=args.inpaint, max_crop_aspect_delta=args.max_crop_aspect_delta)
-                except Exception as e:
-                    exceptions.append((src, dst, e))
-                    if log.isEnabledFor(logging.DEBUG):
-                        log.warning(f"Failed to process {src}: {str(e)}", exc_info=sys.exc_info())
+        queue = Queue()
+
+        def loop():
+            while True:
+                n, src, dst = queue.get()
+                log.info(f"({n+1}/{len(jobs)}) {src} -> {dst}")
+                if not args.overwrite and os.path.exists(dst):
+                    log.info(f"{dst} already exists, skipping")
+                else:
+                    if args.recurse and not args.dry_run:
+                        os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    if args.dry_run:
+                        log.info("Skipping image processing (--dry-run)")
                     else:
-                        log.warning(f"Failed to process {src}: {str(e)}")
+                        try:
+                            process(src, dst, args.size, inpaint=args.inpaint, max_crop_aspect_delta=args.max_crop_aspect_delta)
+                        except Exception as e:
+                            exceptions.append((src, dst, e))
+                            if log.isEnabledFor(logging.DEBUG):
+                                log.warning(f"Failed to process {src}: {str(e)}", exc_info=sys.exc_info())
+                            else:
+                                log.warning(f"Failed to process {src}: {str(e)}")
+                queue.task_done()
+
+        for _ in range(os.cpu_count()):
+            Thread(target=loop, daemon=True).start()
+
+        for n, (src, dst) in enumerate(jobs):
+            queue.put((n, src, dst))
+
+        queue.join()
 
         if exceptions:
             log.warning(f"{len(exceptions)} image(s) failed to process:")
