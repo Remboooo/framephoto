@@ -6,7 +6,8 @@ from Katna.image import Image as KImage
 import cv2
 import sys
 import logging
-
+from queue import Queue
+from threading import Thread
 
 log = logging.getLogger(__name__)
 kimage = None
@@ -164,7 +165,7 @@ def get_recursive_jobs(source_paths, destination, base_path):
         os.path.join(subdir, image_file)
         for path in paths
         for subdir, _, files in (
-            os.walk(path) if os.path.isdir(path) else [(os.path.dirname(path), 0, [os.path.basename(path)])]
+            os.walk(path, followlinks=True) if os.path.isdir(path) else [(os.path.dirname(path), 0, [os.path.basename(path)])]
         )
         for image_file in files
     )
@@ -256,21 +257,34 @@ def main():
 
         exceptions = []
 
+        queue = Queue()
+
+        def loop():
+            while True:
+                n, src, dst = queue.get()
+                log.info(f"({n+1}/{len(jobs)}) {src} -> {dst}")
+                if not args.overwrite and os.path.exists(dst):
+                    log.info(f"{dst} already exists, skipping")
+                else:
+                    if args.recurse and not args.dry_run:
+                        os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    if args.dry_run:
+                        log.info("Skipping image processing (--dry-run)")
+                    else:
+                        try:
+                            process(src, dst, args.size, inpaint=args.inpaint, max_crop_aspect_delta=args.max_crop_aspect_delta)
+                        except Exception as e:
+                            exceptions.append((src, dst, e))
+                            log.warning(f"Failed to process {src}: {str(e)}")
+                queue.task_done()
+
+        for _ in range(os.cpu_count()):
+            Thread(target=loop, daemon=True).start()
+
         for n, (src, dst) in enumerate(jobs):
-            log.info(f"({n+1}/{len(jobs)}) {src} -> {dst}")
-            if not args.overwrite and os.path.exists(dst):
-                log.info(f"{dst} already exists, skipping")
-                continue
-            if args.recurse and not args.dry_run:
-                os.makedirs(os.path.dirname(dst), exist_ok=True)
-            if args.dry_run:
-                log.info("Skipping image processing (--dry-run)")
-            else:
-                try:
-                    process(src, dst, args.size, inpaint=args.inpaint, max_crop_aspect_delta=args.max_crop_aspect_delta)
-                except Exception as e:
-                    exceptions.append((src, dst, e))
-                    log.warning(f"Failed to process {src}: {str(e)}")
+            queue.put((n, src, dst))
+
+        queue.join()
 
         if exceptions:
             log.warning(f"{len(exceptions)} image(s) failed to process:")
