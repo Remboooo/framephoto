@@ -2,6 +2,8 @@ import glob
 import os
 import platform
 from argparse import ArgumentParser
+
+import enlighten
 from PIL import Image, ImageFilter, ImageDraw, ImageOps
 import numpy as np
 from Katna.image import Image as KImage
@@ -171,7 +173,8 @@ def get_recursive_jobs(source_paths, destination, base_path):
     if base_path is None:
         base_path = os.path.commonpath(paths)
         log.info(f"Base path detected as {base_path}")
-    
+
+    log.info("Collecting images to process...")
     all_files = (
         os.path.join(subdir, image_file)
         for path in paths
@@ -187,6 +190,8 @@ def get_recursive_jobs(source_paths, destination, base_path):
         (image_path, os.path.join(dest, os.path.relpath(image_path, base_path)))
         for image_path in all_files if is_image_file(image_path)
     ]
+
+    log.info("Found %s images", len(jobs))
     
     return jobs
 
@@ -273,6 +278,7 @@ def main():
         exceptions = []
 
         queue = Queue()
+        pbar = enlighten.Counter(total=len(jobs), desc='Processing', unit='images')
 
         def loop():
             while True:
@@ -294,6 +300,7 @@ def main():
                                 log.warning(f"Failed to process {src}: {str(e)}", exc_info=sys.exc_info())
                             else:
                                 log.warning(f"Failed to process {src}: {str(e)}")
+                pbar.update()
                 queue.task_done()
 
         for _ in range(os.cpu_count()):
